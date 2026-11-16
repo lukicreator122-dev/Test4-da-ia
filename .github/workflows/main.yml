@@ -1,0 +1,86 @@
+name: Aetel - abrir site para teste
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutos:
+        description: "Quantos minutos deixar o site no ar (máx. 330)"
+        default: "60"
+
+jobs:
+  site:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+
+    env:
+      # Os Secrets do GitHub têm prioridade sobre o .env do zip.
+      # Crie em: Settings > Secrets and variables > Actions
+      HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
+      AETEL_API_KEY: ${{ secrets.AETEL_API_KEY }}
+      AETEL_BASE_URL: ${{ secrets.AETEL_BASE_URL }}
+      HOST: 0.0.0.0
+      PORT: "3080"
+      MONGO_URI: mongodb://127.0.0.1:27017/Aetel
+      AETEL_PROXY_URL: http://127.0.0.1:3080/api/aetel-proxy
+      NODE_OPTIONS: --max-old-space-size=6144
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descompactar o zip do Aetel
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq unzip
+          ZIP=$(ls Aetel*.zip | head -n 1)
+          echo "Descompactando $ZIP"
+          unzip -q -o "$ZIP" -d app
+          echo "APP_DIR=$(pwd)/app/LibreChat-main" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Instalar dependências
+        working-directory: ${{ env.APP_DIR }}
+        run: npm ci
+
+      - name: Compilar o site
+        working-directory: ${{ env.APP_DIR }}
+        run: npm run frontend
+
+      - name: Iniciar o servidor
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          nohup npm run backend > ../server.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fs http://127.0.0.1:3080/health > /dev/null; then echo "Servidor no ar"; exit 0; fi
+            sleep 3
+          done
+          echo "O servidor não subiu. Últimas linhas do log:"; tail -n 50 ../server.log; exit 1
+
+      - name: Abrir o site (link público)
+        run: |
+          curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3080 > tunnel.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' tunnel.log | head -n 1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          if [ -z "$URL" ]; then echo "Não consegui gerar o link"; cat tunnel.log; exit 1; fi
+          echo "SITE_URL=$URL" >> "$GITHUB_ENV"
+          echo "### Site do Aetel: $URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "=========================================="
+          echo "ABRA NO NAVEGADOR: $URL"
+          echo "=========================================="
+
+      - name: Manter no ar
+        run: |
+          echo "Site no ar em $SITE_URL por ${{ inputs.minutos }} minutos."
+          sleep $(( ${{ inputs.minutos }} * 60 ))
